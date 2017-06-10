@@ -120,15 +120,15 @@ def get_batches(batch_size, fpath='data/RC_2015-01', start_batch=0):
     with open(fpath) as f:
         i = 0
         while True:
-            lines = islice(f, batch_size)
-            i += 1
-            if i <= start_batch:
-                continue
-            lines = list(lines)
-            data = [json.loads(l) for l in lines]
-            if not data:
+            lines = list(islice(f, batch_size))
+            if not lines:
                 return
+            if i < start_batch:
+                i += 1
+                continue
+            data = [json.loads(l) for l in lines]
             yield i, data
+            i += 1
 
 
 class PartialResult(object):
@@ -278,9 +278,6 @@ def get_subreddit_data(subreddits, tokens, vocab, echo_freq=1000):
 
         if i % echo_freq == 0:
             print(i, index[i])
-
-        # if i > 99:
-        #     break
 
         sr_indices = indices_sorted[j: k]
         a = tokens[sr_indices]
