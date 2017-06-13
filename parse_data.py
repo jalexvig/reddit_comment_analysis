@@ -2,20 +2,21 @@ import functools
 import json
 import multiprocessing as mp
 import os
-import pickle
 import queue
 import re
 import shutil
 import time
 from collections import OrderedDict
-from itertools import islice, zip_longest
+from itertools import islice
 
 import numpy as np
-from my_decorators import profile_lines
+import pandas as pd
 from nltk import word_tokenize, pos_tag
 from nltk.stem import WordNetLemmatizer
-from scipy.sparse import csr_matrix, lil_matrix
+from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import CountVectorizer
+
+from utils import pickle_dump, pickle_load
 
 
 class LemmaTokenizer(object):
@@ -58,12 +59,10 @@ def load_save(func=None, fpath=None):
     def inner(*args, **kwargs):
 
         if os.path.isfile(fpath):
-            with open(fpath, 'rb') as f:
-                res = pickle.load(f)
+            res = pickle_load(fpath)
         else:
             res = func(*args, **kwargs)
-            with open(fpath, 'wb') as f:
-                pickle.dump(res, f)
+            pickle_dump(res, fpath)
 
         return res
 
@@ -127,6 +126,17 @@ def get_batches(batch_size, fpath='data/RC_2015-01', start_batch=0):
             i += 1
 
 
+def iter_dpath(dpath, echo_freq=0):
+
+    t0 = time.time()
+    for i, fname in enumerate(os.listdir(dpath)):
+        if echo_freq and (i % echo_freq == 0):
+            print(i, time.time() - t0)
+            t0 = time.time()
+        fpath = os.path.join(dpath, fname)
+        yield fpath
+
+
 class PartialResult(object):
 
     def __init__(self, tokens, vocab, subreddits, ids=None):
@@ -142,16 +152,10 @@ class PartialResult(object):
         vocab = set()
         subreddits = set()
 
-        t0 = time.time()
-        for i, fname in enumerate(os.listdir(dpath)):
-            if echo_freq and (i % echo_freq == 0):
-                print(i, time.time() - t0)
-                t0 = time.time()
-            fpath = os.path.join(dpath, fname)
-            with open(fpath, 'rb') as f:
-                pr = pickle.load(f)
-                vocab.update(pr.vocab)
-                subreddits.update(pr.subreddits)
+        for fpath in iter_dpath(dpath, echo_freq):
+            pr = pickle_load(fpath)
+            vocab.update(pr.vocab)
+            subreddits.update(pr.subreddits)
 
         vocab = OrderedDict(zip(sorted(vocab), range(len(vocab))))
         subreddits = OrderedDict(zip(sorted(subreddits), range(len(subreddits))))
@@ -161,25 +165,30 @@ class PartialResult(object):
     @staticmethod
     def combine_dpath(dpath='data/vectorized_data', echo_freq=1, chunk_size=50):
 
+        # Note: this method collapses subreddits
+
         vocab_dict, subreddits_dict = PartialResult.get_metadata(dpath)
 
-        counts = csr_matrix((len(subreddits_dict), len(vocab_dict)), dtype=np.int8)
+        subreddits = np.array(list(subreddits_dict))
+        # Note: can't do same thing since some words very long and numpy array elems must have same size
+        vocab = np.empty(len(vocab_dict), dtype='object')
+        for i, val in enumerate(vocab_dict):
+            vocab[i] = val
+
+        sr_counts = pd.Series(0, index=subreddits)
 
         partial_counts = []
 
-        t0 = time.time()
-        for i, fname in enumerate(os.listdir(dpath)):
-            if i % echo_freq == 0:
-                print(i, time.time() - t0)
-                t0 = time.time()
-            fpath = os.path.join(dpath, fname)
-            with open(fpath, 'rb') as f:
-                pr = pickle.load(f)
-                pr_matrix = pr.tokens.tocoo()
+        counts = csr_matrix((len(subreddits_dict), len(vocab_dict)), dtype=np.int64)
+        for i, fpath in enumerate(iter_dpath(dpath, echo_freq)):
+            pr = pickle_load(fpath)
+            pr_matrix = pr.tokens.tocoo()
 
-                row_indices = [subreddits_dict[pr.subreddits[i]] for i in pr_matrix.row]
-                col_indices = [vocab_dict[pr.vocab[i]] for i in pr_matrix.col]
-                counts[row_indices, col_indices] += pr_matrix.data
+            row_indices = [subreddits_dict[pr.subreddits[i]] for i in pr_matrix.row]
+            col_indices = [vocab_dict[pr.vocab[i]] for i in pr_matrix.col]
+            counts[row_indices, col_indices] += pr_matrix.data
+
+            sr_counts += pd.Series(pr.subreddits).value_counts().reindex(sr_counts.index, fill_value=0)
 
             if i and (i % chunk_size == 0):
                 partial_counts.append(counts)
@@ -189,15 +198,9 @@ class PartialResult(object):
 
         counts = sum(partial_counts)
 
-        subreddits = np.array(list(subreddits_dict))
-        # Note: can't do same thing since some words very long and numpy array elems must have same size
-        vocab = np.empty(len(vocab_dict), dtype='object')
-        for i, val in enumerate(vocab_dict):
-            vocab[i] = val
-
         res = PartialResult(counts, vocab, subreddits)
 
-        return res
+        return res, sr_counts
 
     @staticmethod
     def combine(partial_results):
@@ -212,8 +215,6 @@ class PartialResult(object):
         ids = list(partial_results[0].ids)
 
         for i, pr in enumerate(partial_results[1:]):
-            if i % 10 == 0:
-                print(i)
             tokens.data = np.concatenate((tokens.data, pr.tokens.data))
             tokens.indices = np.concatenate((tokens.indices, pr.tokens.indices))
             tokens.indptr = np.concatenate((tokens.indptr, pr.tokens.indptr[1:] + tokens.nnz))
@@ -266,15 +267,15 @@ def proc_batch(i, batch, dpath_out):
     vocab = vect.get_feature_names()
 
     fpath = os.path.join(dpath_out, '%i.pkl' % i)
-    with open(fpath, 'wb') as f:
-        pickle.dump(PartialResult(res, vocab, subreddits, ids), f)
+    pickle_dump(PartialResult(res, vocab, subreddits, ids), fpath)
 
     print(i, time.time() - t0)
 
     return res
 
 
-def main(dpath_out='data/vectorized_data', resume=True, batch_size=100000, multiproc=True):
+@load_save(fpath='data/result.pkl')
+def get_data(dpath_out='data/vectorized_data', resume=True, batch_size=100000, multiproc=True):
 
     if not os.path.isdir(dpath_out):
         os.mkdir(dpath_out)
@@ -302,67 +303,12 @@ def main(dpath_out='data/vectorized_data', resume=True, batch_size=100000, multi
 
     print(time.time() - t_start)
 
+    res, sr_counts = PartialResult.combine_dpath()
+    pickle_dump((res, sr_counts), 'result.pkl')
 
-def get_all_results(dpath='data/vectorized_data/', combine_freq=10):
-
-    l = []
-
-    for i, fname in enumerate(os.listdir(dpath)):
-        print(i)
-        fpath = os.path.join(dpath, fname)
-        with open(fpath, 'rb') as f:
-            l.append(pickle.load(f))
-
-        if i and (i % combine_freq == 0):
-            l = [PartialResult.combine(l)]
-
-    res = PartialResult.combine(l)
-
-    return res
-
-
-def get_subreddit_data(subreddits, counts, echo_freq=10):
-
-    subreddits = np.array(subreddits)
-
-    indices_sorted = np.argsort(subreddits)
-    subreddits_sorted = np.sort(subreddits)
-    indices_sorted_change = np.where(subreddits_sorted[:-1] != subreddits_sorted[1:])[0] + 1
-    indices_sorted_change = indices_sorted_change.tolist()
-    indices_sorted_change = np.insert(indices_sorted_change, 0, 0)
-
-    subreddits_unique = np.unique(subreddits_sorted)
-
-    data = []
-    indices = []
-    indptr = []
-
-    t0 = time.time()
-    for i, (j, k) in enumerate(zip_longest(indices_sorted_change, indices_sorted_change[1:])):
-
-        if i % echo_freq == 0:
-            print(i, time.time() - t0, subreddits_unique[i])
-            t0 = time.time()
-
-        sr_indices = indices_sorted[j: k]
-        a = counts[sr_indices]
-        b = a.sum(axis=0)
-        sr_csr = csr_matrix(b)
-
-        data.append(sr_csr.data)
-        indices.append(sr_csr.indices)
-        indptr.append(sr_csr.indptr[1])
-
-    data = np.concatenate(data)
-    indices = np.concatenate(indices)
-    indptr.insert(0, 0)
-    indptr = np.cumsum(indptr)
-
-    data = csr_matrix((data, indices, indptr))
-
-    return data, subreddits_unique
+    return res, sr_counts
 
 
 if __name__ == '__main__':
 
-    main(resume=True)
+    get_data(resume=True)
