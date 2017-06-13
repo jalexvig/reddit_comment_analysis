@@ -8,7 +8,7 @@ import re
 import shutil
 import time
 from collections import OrderedDict
-from itertools import islice
+from itertools import islice, zip_longest
 
 import numpy as np
 from my_decorators import profile_lines
@@ -137,7 +137,7 @@ class PartialResult(object):
         self.ids = ids
 
     @staticmethod
-    def get_metadata(dpath, echo_freq=10):
+    def get_metadata(dpath, echo_freq=100):
 
         vocab = set()
         subreddits = set()
@@ -161,9 +161,9 @@ class PartialResult(object):
     @staticmethod
     def combine_dpath(dpath='data/vectorized_data', echo_freq=1, chunk_size=50):
 
-        vocab, subreddits = PartialResult.get_metadata(dpath)
+        vocab_dict, subreddits_dict = PartialResult.get_metadata(dpath)
 
-        counts = csr_matrix((len(subreddits), len(vocab)), dtype=np.int8)
+        counts = csr_matrix((len(subreddits_dict), len(vocab_dict)), dtype=np.int8)
 
         partial_counts = []
 
@@ -177,17 +177,23 @@ class PartialResult(object):
                 pr = pickle.load(f)
                 pr_matrix = pr.tokens.tocoo()
 
-                row_indices = [subreddits[pr.subreddits[i]] for i in pr_matrix.row]
-                col_indices = [vocab[pr.vocab[i]] for i in pr_matrix.col]
+                row_indices = [subreddits_dict[pr.subreddits[i]] for i in pr_matrix.row]
+                col_indices = [vocab_dict[pr.vocab[i]] for i in pr_matrix.col]
                 counts[row_indices, col_indices] += pr_matrix.data
 
             if i and (i % chunk_size == 0):
                 partial_counts.append(counts)
-                counts = csr_matrix((len(subreddits), len(vocab)), dtype=np.int8)
+                counts = csr_matrix((len(subreddits_dict), len(vocab_dict)), dtype=np.int8)
 
         partial_counts.append(counts)
 
         counts = sum(partial_counts)
+
+        subreddits = np.array(list(subreddits_dict))
+        # Note: can't do same thing since some words very long and numpy array elems must have same size
+        vocab = np.empty(len(vocab_dict), dtype='object')
+        for i, val in enumerate(vocab_dict):
+            vocab[i] = val
 
         res = PartialResult(counts, vocab, subreddits)
 
@@ -315,39 +321,46 @@ def get_all_results(dpath='data/vectorized_data/', combine_freq=10):
     return res
 
 
-def get_subreddit_data(subreddits, tokens, echo_freq=1000):
+def get_subreddit_data(subreddits, counts, echo_freq=10):
 
     subreddits = np.array(subreddits)
-
-    data = []
 
     indices_sorted = np.argsort(subreddits)
     subreddits_sorted = np.sort(subreddits)
     indices_sorted_change = np.where(subreddits_sorted[:-1] != subreddits_sorted[1:])[0] + 1
-    indices_sorted_change = np.insert(indices_sorted_change, [0, -1], [0, len(subreddits)])
+    indices_sorted_change = indices_sorted_change.tolist()
+    indices_sorted_change = np.insert(indices_sorted_change, 0, 0)
 
-    index = np.unique(subreddits_sorted)
-    # index = index[:100]
+    subreddits_unique = np.unique(subreddits_sorted)
 
-    for i, (j, k) in enumerate(zip(indices_sorted_change, indices_sorted_change[1:])):
+    data = []
+    indices = []
+    indptr = []
+
+    t0 = time.time()
+    for i, (j, k) in enumerate(zip_longest(indices_sorted_change, indices_sorted_change[1:])):
 
         if i % echo_freq == 0:
-            print(i, index[i])
+            print(i, time.time() - t0, subreddits_unique[i])
+            t0 = time.time()
 
         sr_indices = indices_sorted[j: k]
-        a = tokens[sr_indices]
+        a = counts[sr_indices]
         b = a.sum(axis=0)
-        c = np.asarray(b)
-        sr_tokens = np.squeeze(c)
-        data.append(sr_tokens)
+        sr_csr = csr_matrix(b)
 
-    data = np.stack(data)
+        data.append(sr_csr.data)
+        indices.append(sr_csr.indices)
+        indptr.append(sr_csr.indptr[1])
 
-    data = csr_matrix(data)
+    data = np.concatenate(data)
+    indices = np.concatenate(indices)
+    indptr.insert(0, 0)
+    indptr = np.cumsum(indptr)
 
-    # df = pd.DataFrame(data, index=index, columns=vocab)
+    data = csr_matrix((data, indices, indptr))
 
-    return data, index
+    return data, subreddits_unique
 
 
 if __name__ == '__main__':
